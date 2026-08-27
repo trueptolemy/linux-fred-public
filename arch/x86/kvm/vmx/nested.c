@@ -3613,8 +3613,45 @@ static int nested_vmx_check_permission(struct kvm_vcpu *vcpu)
 	return 1;
 }
 
+/*
+ * Describe the loading state of L2 guest state, i.e. whether VM-Entry loaded
+ * L2's state from vmcs12 into vmcs02, and whether L2's state is synced back to
+ * vmcs12.
+ */
+enum nested_l2_state {
+	/* VM-entry failed before finishing loading L2's state. */
+	L2_STATE_NOT_LOADED,
+	/* VM-entry loaded L2's state from vmcs12 into vmcs02 before L2 runs. */
+	L2_STATE_LOADED_FROM_VMCS12,
+	/* L2 ran, and KVM saved L2's live state to vmcs12 from vmcs02 on VM-exit. */
+	L2_STATE_SAVED_TO_VMCS12,
+};
+
+/*
+ * Return true if L2's guest state in vmcs12 needs to be loaded into vmcs01,
+ * i.e. if L1 should observe L2's state retained on hardware when L1 runs.
+ * @vm_entry_load_control is the VM-Entry control that loads the state on
+ * VM-Entry.
+ *
+ * Note: this helper is used when the VM-exit load (host state) control is off.
+ * Otherwise, host state (L1 state) should be loaded into vmcs01.
+ */
+static bool nested_l2_state_is_live(struct vmcs12 *vmcs12,
+				    u32 vm_entry_load_control,
+				    enum nested_l2_state l2_state)
+{
+	/* normal VM-exit. */
+	if (l2_state == L2_STATE_SAVED_TO_VMCS12)
+		return true;
+
+	/* true iff VM-entry failed after loading L2's state. */
+	return l2_state == L2_STATE_LOADED_FROM_VMCS12 &&
+	       (vmcs12->vm_entry_controls & vm_entry_load_control);
+}
+
 static void load_vmcs12_host_state(struct kvm_vcpu *vcpu,
-				   struct vmcs12 *vmcs12);
+				   struct vmcs12 *vmcs12,
+				   enum nested_l2_state l2_state);
 
 /*
  * If from_vmentry is false, this is being called from state restore (either RSM
@@ -3636,6 +3673,7 @@ enum nvmx_vmentry_status nested_vmx_enter_non_root_mode(struct kvm_vcpu *vcpu,
 		.basic = EXIT_REASON_INVALID_STATE,
 		.failed_vmentry = 1,
 	};
+	enum nested_l2_state l2_state = L2_STATE_NOT_LOADED;
 	u32 failed_index;
 
 	trace_kvm_nested_vmenter(kvm_rip_read(vcpu),
@@ -3699,6 +3737,13 @@ enum nvmx_vmentry_status nested_vmx_enter_non_root_mode(struct kvm_vcpu *vcpu,
 		vmcs12->exit_qualification = entry_failure_code;
 		goto vmentry_fail_vmexit_guest_mode;
 	}
+
+	/*
+	 * VM-entry has completed the architectural guest-state loading phase;
+	 * MSRs are loaded after guest state, so failures below should retain
+	 * L2's state (see nested_l2_state_is_live()).
+	 */
+	l2_state = L2_STATE_LOADED_FROM_VMCS12;
 
 	if (from_vmentry) {
 		failed_index = nested_vmx_load_msr(vcpu,
@@ -3770,7 +3815,7 @@ vmentry_fail_vmexit:
 
 	nested_put_vmcs12_pages(vcpu);
 
-	load_vmcs12_host_state(vcpu, vmcs12);
+	load_vmcs12_host_state(vcpu, vmcs12, l2_state);
 	vmcs12->vm_exit_reason = exit_reason.full;
 	if (enable_shadow_vmcs || nested_vmx_is_evmptr12_valid(vmx))
 		vmx->nested.need_vmcs12_to_shadow_sync = true;
@@ -4788,7 +4833,8 @@ static void prepare_vmcs12(struct kvm_vcpu *vcpu, struct vmcs12 *vmcs12,
  * This function should be called when the active VMCS is L1's (vmcs01).
  */
 static void load_vmcs12_host_state(struct kvm_vcpu *vcpu,
-				   struct vmcs12 *vmcs12)
+				   struct vmcs12 *vmcs12,
+				   enum nested_l2_state l2_state)
 {
 	enum vm_entry_failure_code ignored;
 	struct kvm_segment seg;
@@ -4846,12 +4892,13 @@ static void load_vmcs12_host_state(struct kvm_vcpu *vcpu,
 	/*
 	 * Load CET state from host state if VM_EXIT_LOAD_CET_STATE is set.
 	 * otherwise CET state should be retained across VM-exit, i.e.,
-	 * guest values should be propagated from vmcs12 to vmcs01.
+	 * guest values should be propagated from vmcs12 to vmcs01, but only if
+	 * L2's CET state is live in hardware.
 	 */
 	if (vmcs12->vm_exit_controls & VM_EXIT_LOAD_CET_STATE)
 		vmcs_write_cet_state(vcpu, vmcs12->host_s_cet, vmcs12->host_ssp,
 				     vmcs12->host_ssp_tbl);
-	else
+	else if (nested_l2_state_is_live(vmcs12, VM_ENTRY_LOAD_CET_STATE, l2_state))
 		vmcs_write_cet_state(vcpu, vmcs12->guest_s_cet, vmcs12->guest_ssp,
 				     vmcs12->guest_ssp_tbl);
 
@@ -5182,7 +5229,7 @@ void __nested_vmx_vmexit(struct kvm_vcpu *vcpu, u32 vm_exit_reason,
 						       vmcs12->vm_exit_intr_error_code,
 						       KVM_ISA_VMX);
 
-		load_vmcs12_host_state(vcpu, vmcs12);
+		load_vmcs12_host_state(vcpu, vmcs12, L2_STATE_SAVED_TO_VMCS12);
 
 		/*
 		 * Process events if an injectable IRQ or NMI is pending, even
