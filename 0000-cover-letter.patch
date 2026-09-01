@@ -1,0 +1,206 @@
+From c9db14bd78b37827634e7c427a0a29e30b8e8b82 Mon Sep 17 00:00:00 2001
+From: Zhao Liu <zhao1.liu@intel.com>
+Date: Tue, 1 Sep 2026 15:50:16 +0800
+Subject: [RFC 0/4] KVM: nVMX: Fix CET state handling on VM-entry failure
+
+Hi,
+
+This series tries to point out the missing guest state retain behavior
+in the current KVM handling for the nested vm-entry failure case, by a
+CET nested selftest (patch 4), and to raise a discussion on how KVM
+retains guest state at VM-entry failure.
+
+Currently, I think there are two possible fix approaches: one is patch 1,
+which explicitly enumerates the stages, and the other is option B
+mentioned in section "Option B", which uses (or reuse pre_vmenter_* ?)
+intermediate variables to cache the guest state between vmcs01 and
+vmcs02.
+
+Back to problem (using CET as the example), at present, on a nested
+VM-exit with VM_EXIT_LOAD_CET_STATE cleared, KVM unconditionally copies
+vmcs12's guest CET fields into vmcs01. When the VM-exit is a VM-entry
+failure that occurred before guest state was loaded, those fields hold
+what L1 wrote for L2, not what the CPU would have kept, so L1 resumes
+with the S_CET/SSP/INTERRUPT_SSP_TABLE_ADDR it had programmed for L2.
+
+This does not conform to the SDM's description of vm-entry failure.
+
+Background
+==========
+
+What L1 should observe after a nested VM-exit depends on three things:
+the VM-exit "load host state" control, whether VM-entry got far enough
+to load L2's state, and whether L2 ran. For CET:
+
+ 1) VM_EXIT_LOAD_CET_STATE set: load L1's state from vmcs12's host
+    fields, no matter what happened before. KVM already does this, and
+    setting this control makes L1 immune to the bug below.
+
+ 2) Control clear, VM-entry loaded L2's CET state: the guest state is
+    retained on the CPU, so L1 observes it. Copying vmcs12's guest
+    fields into vmcs01 gives the right result.
+
+ 3) Control clear, VM-entry did not load L2's CET state (VM-entry
+    failed before the guest-state loading phase): the CPU keeps L1's
+    own state, so KVM must do nothing.
+
+ 4) Control clear, VM-entry did not load CET state, but L2 ran and
+    exited normally: L2 may have changed the state while running, and
+    vmcs12's guest fields hold what L2 left behind (guest CET state is
+    always saved on VM-exit; there is no VM-exit control for it), so
+    copying them is again correct.
+
+Case 3) is broken today: KVM never syncs vmcs02 back to vmcs12 on the
+VM-entry failure path, so vmcs12's guest fields still hold whatever L1
+wrote with VMWRITE, and KVM stuffs that into vmcs01.
+
+Note that one "VM-entry failed" flag is not enough to distinguish 2)
+from 3), because EXIT_REASON_MSR_LOAD_FAIL is raised after guest state
+has been loaded while EXIT_REASON_INVALID_STATE is not.
+
+Option A (this series)
+======================
+
+Track how far VM-entry got, and use that at VM-exit to decide whether
+vmcs12's guest fields are a faithful copy of what the CPU holds:
+
+  enum nested_l2_state {
+	L2_STATE_NOT_LOADED,		/* VM-entry failed before the
+					   guest-state loading phase */
+	L2_STATE_LOADED_FROM_VMCS12,
+	L2_STATE_SAVED_TO_VMCS12,	/* L2 ran, state synced back */
+  };
+
+nested_vmx_enter_non_root_mode() sets L2_STATE_LOADED_FROM_VMCS12 right
+after prepare_vmcs02() succeeds, __nested_vmx_vmexit() passes
+L2_STATE_SAVED_TO_VMCS12, and nested_l2_state_is_live() folds the three
+states plus the VM-entry load control into one predicate.
+
+Pros: small, self-contained, no new state that outlives the transition
+(the enum is a local + one parameter), and the per-feature cost is one
+stage check in load_vmcs12_host_state().
+
+Cons: the VM-exit path now has to look at vmcs12->vm_entry_controls,
+which is odd, because that control belongs to VM-entry.
+
+Option B (not implemented)
+==========================
+
+On a VM-exit, the host-state loading step only ever does one of two
+things: load the register from the VMCS host field, or leave the register
+alone. It does not care why the VM-exit happened, nor how far a failed
+VM-entry got. But KVM cannot simply "leave the register alone", because
+the live value sits in the guest fields of the current VMCS, so it moves
+when KVM switches from vmcs02 back to vmcs01.
+
+KVM already solves this for the L1->L2 direction, with
+nested.pre_vmenter_{s_cet,ssp,ssp_tbl}: L1's live value is read from
+vmcs01 before the switch, and written into vmcs02 if VM-entry does not
+load CET state. The L2->L1 direction has no such variable and uses
+vmcs12's guest fields instead. That is where the bug comes from.
+
+So the other way to fix this is to keep those fields updated in both
+directions. They would then hold more than the pre-VM-entry value, so
+they'd want a new name as well (nested.cet_state, i.e. drop the
+"pre_vmenter" prefix again :-)):
+
+  nested_vmx_enter_non_root_mode()
+	read the live state from vmcs01		/* unconditionally */
+	switch to vmcs02
+	guest-state checks fail  -> exit path, value is still L1's
+	prepare_vmcs02() fails   -> exit path, value is still L1's
+	/* guest-state loading phase */
+	if (VM_ENTRY_LOAD_CET_STATE)
+		value = vmcs12 guest fields
+	write the value into vmcs02
+	/* MSR loading phase; on failure the value is already correct */
+
+  prepare_vmcs12()				/* real VM-exits only */
+	read the live state from vmcs02 into vmcs12's guest fields
+	and into the tracked value
+
+  load_vmcs12_host_state()
+	if (VM_EXIT_LOAD_CET_STATE)
+		value = vmcs12 host fields
+	write the value into vmcs01		/* unconditionally */
+
+Pros: no history to reconstruct at VM-exit, no reference to the
+VM-entry control from the VM-exit path, symmetric with the existing
+L1->L2 handling, and it works for state that is not synced back to
+vmcs12.
+
+Cons: a wider diff (VM-entry path, prepare_vmcs02(), prepare_vmcs12(),
+load_vmcs12_host_state()), and the tracked value is a "second copy" [*]
+of live state, which introduces a third place where guest state lives,
+next to vmcs01/vmcs02 and vmcs12, and every affected state needs its
+own variable. So this is the approach that grows with the number of
+features, whereas Option A's staging enum is shared by all of them.
+
+[*]: "second copy" may be inaccurate, since several places already hold
+guest state outside the VMCS: EFER and PAT are kept in vcpu->arch.*,
+which survives the VMCS switch for free, while CET and BNDCFGS live only
+in the VMCS and already need their own nested.pre_vmenter_* fields for
+the L1->L2 direction. No single unified place is a pity indeed.
+
+Extensibility
+=============
+
+Any feature with a VM-exit "load host state" (or "clear") control has to
+answer the same question: with that control set/clear, what state to
+retain for l1? So this is not only about CET:
+
+ * EFER is correct, because vcpu->arch.efer holds L2's value and
+   the vmx_set_efer() at the end of that if/else chain writes vmcs01
+   unconditionally.
+
+ * CET is broken, which is what patch 1 fixes.
+
+ * BNDCFGS is broken: load_vmcs12_host_state() only handles
+   VM_EXIT_CLEAR_BNDCFGS, so with that control clear L2's value is lost
+   and L1 resumes with its own. MPX is limited to a few older CPUs.
+
+ * PAT is broken: with VM_EXIT_LOAD_IA32_PAT clear, vmcs01.GUEST_IA32_PAT
+   keeps L1's pre-VM-entry value while vcpu->arch.pat holds L2's, so L1
+   resumes with its own PAT but reads L2's back with RDMSR.
+
+ * (in future) FRED also needs to consider this.
+
+Testing
+=======
+
+The selftest gives L1, L2 and vmcs12's host fields three different sets
+of CET values, so that whichever one L1 ends up with tells us where it
+came from. For each of the 4 combinations of VM_ENTRY_LOAD_CET_STATE and
+VM_EXIT_LOAD_CET_STATE, it triggers both kinds of VM-entry failure and
+then checks what L1 reads back:
+
+ - EXIT_REASON_INVALID_STATE: guest CR0 with PG set and PE clear.
+ - EXIT_REASON_MSR_LOAD_FAIL: a VM-entry MSR load list entry for
+   MSR_IA32_UCODE_REV.
+
+MSR_IA32_INTERRUPT_SSP_TABLE_ADDR is the primary observation point
+because KVM always intercepts it and reads it straight out of
+vmcs01.GUEST_INTR_SSP_TABLE. The test requires SHSTK and skips
+otherwise.
+
+Thanks,
+Zhao
+---
+Zhao Liu (4):
+  KVM: nVMX: Don't copy L2's CET state to L1 if VM-entry didn't load it
+  KVM: selftests: Synchronize and update VMCS controls
+  KVM: selftests: Synchronize and update VMCS encodings
+  KVM: selftests: Test VM-entry failure handling for nested VM
+
+ arch/x86/kvm/vmx/nested.c                     |  59 ++-
+ tools/testing/selftests/kvm/Makefile.kvm      |   1 +
+ tools/testing/selftests/kvm/include/x86/vmx.h | 489 ++++++++++--------
+ .../selftests/kvm/include/x86/vmxfeatures.h   |  93 ++++
+ .../x86/vmx_nested_entry_fail_state_test.c    | 296 +++++++++++
+ 5 files changed, 711 insertions(+), 227 deletions(-)
+ create mode 100644 tools/testing/selftests/kvm/include/x86/vmxfeatures.h
+ create mode 100644 tools/testing/selftests/kvm/x86/vmx_nested_entry_fail_state_test.c
+
+-- 
+2.34.1
+
